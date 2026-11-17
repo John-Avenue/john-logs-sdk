@@ -46,7 +46,7 @@ import (
 )
 
 // Version is this SDK's version, sent with every batch.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 // LevelTrace is below Debug: whole request and response bodies, every step.
 // Check logger.Enabled(ctx, LevelTrace) before building anything expensive.
@@ -99,6 +99,12 @@ type Config struct {
 	// DropNewest. Either way the loss is counted, reported by Stats and
 	// OnState, and announced to the gateway.
 	WhenFull FullPolicy
+	// SpoolKeep is how many bytes of batches the gateway has already taken
+	// stay in a disk spool, newest kept longest, so Hold can read a session
+	// back from this machine while the gateway's copy is still being indexed
+	// or the upload is behind. It is room inside SpoolMax, given up the moment
+	// waiting batches need it. Default 0: a batch is deleted once accepted.
+	SpoolKeep int64
 	// Uploads is how many batches may be on their way at once (default 4).
 	// The client starts at 2 and backs off to 1 while the gateway struggles.
 	Uploads int
@@ -284,7 +290,7 @@ func New(cfg Config) *Client {
 	if cfg.URL == "" {
 		return c
 	}
-	sp, err := openSpool(spoolOpts{dir: cfg.Spool, max: cfg.SpoolMax, policy: cfg.WhenFull, segBytes: segBytes(cfg.SpoolMax), segAge: time.Minute})
+	sp, err := openSpool(spoolOpts{dir: cfg.Spool, max: cfg.SpoolMax, keep: cfg.SpoolKeep, policy: cfg.WhenFull, segBytes: segBytes(cfg.SpoolMax), segAge: time.Minute})
 	if err != nil {
 		// A spool that will not open (read-only disk, every slot taken) must
 		// not turn logging off: fall back to memory and say so.

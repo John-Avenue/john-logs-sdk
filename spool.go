@@ -28,7 +28,11 @@ import (
 //	dead/<id>.jlb   batches the gateway refused as malformed, kept for a person
 //
 // A segment is deleted once every frame in it is accepted and it is no longer
-// the one being written. Bodies in a segment are only ever compressed against
+// the one being written — unless Config.SpoolKeep keeps it a while longer, so
+// what this process logged can be read back from its own disk (held.go)
+// without asking the gateway, which may be minutes behind. Kept segments are
+// free room: they go first, oldest first, when the spool needs the space, and
+// they do not count as used. Bodies in a segment are only ever compressed against
 // bases in the same segment (see delta.go), so deleting the oldest segment to
 // make room never breaks a newer one.
 
@@ -68,12 +72,14 @@ type segment struct {
 	size    int64
 	frames  []*frame
 	opened  time.Time
-	pending int // frames not acked
+	pending int  // frames not acked
+	kept    bool // every frame accepted; on disk only for reading back
 }
 
 type spool struct {
 	dir      string // "" in memory
 	max      int64
+	keep     int64 // bytes of accepted segments to keep for reading back
 	policy   FullPolicy
 	segBytes int64
 	segAge   time.Duration
@@ -82,6 +88,9 @@ type spool struct {
 	lock    *os.File
 	segs    []*segment
 	size    int64 // bytes held, on disk or in memory
+	kept    int64 // of size, the kept segments
+	readers int   // holds open (held.go): files are not deleted under them
+	doomed  []*segment
 	pendB   int64 // bytes not yet accepted
 	pendR   int64 // records not yet accepted
 	dirty   bool
@@ -92,13 +101,14 @@ type spool struct {
 type spoolOpts struct {
 	dir      string
 	max      int64
+	keep     int64
 	policy   FullPolicy
 	segBytes int64
 	segAge   time.Duration
 }
 
 func openSpool(o spoolOpts) (*spool, error) {
-	s := &spool{max: o.max, policy: o.policy, segBytes: o.segBytes, segAge: o.segAge, nextSeq: 1}
+	s := &spool{max: o.max, keep: o.keep, policy: o.policy, segBytes: o.segBytes, segAge: o.segAge, nextSeq: 1}
 	if o.dir == "" {
 		return s, nil
 	}
@@ -213,6 +223,19 @@ func readAcks(path string) map[int64]bool {
 }
 
 func (s *spool) removeFiles(seg *segment) {
+	s.size -= seg.size
+	if seg.kept {
+		seg.kept = false
+		s.kept -= seg.size
+	}
+	if s.readers > 0 {
+		s.doomed = append(s.doomed, seg) // a reader has it; release deletes it
+		return
+	}
+	s.deleteFiles(seg)
+}
+
+func (s *spool) deleteFiles(seg *segment) {
 	if seg.f != nil {
 		seg.f.Close()
 		os.Remove(seg.f.Name())
@@ -223,7 +246,37 @@ func (s *spool) removeFiles(seg *segment) {
 	if s.dir != "" {
 		os.Remove(filepath.Join(s.dir, segName(seg.seq)+".ack"))
 	}
-	s.size -= seg.size
+}
+
+// retireLocked is the end of a segment whose every frame is accepted and
+// which is no longer written to: deleted, or kept for reading back while it
+// fits in keep.
+func (s *spool) retireLocked(seg *segment) {
+	i := slices.Index(s.segs, seg)
+	if i < 0 || seg.kept {
+		return
+	}
+	if s.dir == "" || seg.size == 0 || seg.size > s.keep {
+		s.removeFiles(seg)
+		s.segs = slices.Delete(s.segs, i, i+1)
+		return
+	}
+	seg.kept = true
+	s.kept += seg.size
+	s.trimKeptLocked(s.keep)
+}
+
+// trimKeptLocked deletes kept segments, oldest first, until at most budget
+// bytes of them remain.
+func (s *spool) trimKeptLocked(budget int64) {
+	for i := 0; i < len(s.segs) && s.kept > max(budget, 0); {
+		if seg := s.segs[i]; seg.kept {
+			s.removeFiles(seg)
+			s.segs = slices.Delete(s.segs, i, i+1)
+			continue
+		}
+		i++
+	}
 }
 
 // cur is the segment being written, nil before the first append.
@@ -256,6 +309,9 @@ func (s *spool) append(batch []byte, records int, gen uint64) (dropped int64, er
 		return int64(records), errors.New("johnlogs: spool closed")
 	}
 	need := int64(frameHead + len(batch))
+	if s.size+need > s.max {
+		s.trimKeptLocked(s.kept - (s.size + need - s.max)) // kept segments are free room
+	}
 	if s.size+need > s.max {
 		if s.policy == DropOldest {
 			dropped = s.dropOldestLocked(s.size + need - s.max)
@@ -301,8 +357,7 @@ var errSpoolFull = errors.New("johnlogs: spool full")
 
 func (s *spool) rotateLocked(seq uint64) (*segment, error) {
 	if old := s.curLocked(); old != nil && old.pending == 0 && !hasInflight(old) {
-		s.removeFiles(old)
-		s.segs = s.segs[:len(s.segs)-1]
+		s.retireLocked(old)
 	}
 	seg := &segment{seq: seq, opened: time.Now()}
 	if s.dir != "" {
@@ -415,10 +470,7 @@ func (s *spool) ack(f *frame) {
 		seg.size -= int64(frameHead + f.n)
 	}
 	if seg.pending == 0 && seg != s.curLocked() && !hasInflight(seg) {
-		if i := slices.Index(s.segs, seg); i >= 0 {
-			s.removeFiles(seg)
-			s.segs = slices.Delete(s.segs, i, i+1)
-		}
+		s.retireLocked(seg)
 	}
 }
 
@@ -454,7 +506,7 @@ type spoolStats struct {
 func (s *spool) stats() spoolStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := spoolStats{pendingBytes: s.pendB, pendingRecords: s.pendR, used: s.size, max: s.max}
+	st := spoolStats{pendingBytes: s.pendB, pendingRecords: s.pendR, used: s.size - s.kept, max: s.max}
 	for _, seg := range s.segs {
 		if seg.pending > 0 {
 			st.oldest = seg.opened
@@ -504,5 +556,9 @@ func (s *spool) close() {
 			os.Remove(filepath.Join(s.dir, segName(seg.seq)+".ack"))
 		}
 	}
+	for _, seg := range s.doomed {
+		s.deleteFiles(seg)
+	}
+	s.doomed = nil
 	unlockSlot(s.lock)
 }
