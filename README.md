@@ -87,6 +87,27 @@ memory.
 `SpoolMax` caps it (10 GiB on disk, 256 MiB in memory). At the cap,
 `WhenFull` decides what goes: `DropOldest` (default) or `DropNewest`.
 
+## Reading a session back
+
+The gateway's copy of a run is as far behind as its ingest: minutes, when a
+burst outruns it. Everything the run logged is already on this machine, in the
+spool, so it can be read back here:
+
+```go
+held := logs.Hold()            // nil without a disk spool
+defer held.Close()             // nothing it sees is deleted until then
+recs, err := held.Session(id)  // the records whose session_id is id, as the log returns them
+body, err := held.Body(ref)    // a record's req_body_ref / resp_body_ref, whole
+err = har.Write(w, recs, held.Body, har.Options{})
+```
+
+That covers the batches still waiting. `SpoolKeep` (bytes, default 0) also
+keeps accepted ones on disk, newest longest, so a run is whole here after it
+uploaded. Kept batches are room inside `SpoolMax` that waiting ones take back
+the moment they need it, they do not count as used, and Close deletes them.
+`Session` reads every held batch's records (not bodies): about a second for
+2 GiB of spool.
+
 ## Being loud
 
 - `Client.Stats()`: state (`ok`, `behind`, `failing`, `full`), what is waiting,
